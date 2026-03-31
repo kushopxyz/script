@@ -5,11 +5,6 @@
 # No domain, IP access only
 # =========================
 
-if [[ "${EUID}" -ne 0 ]]; then
-  echo "Please run this script as root: sudo bash $0"
-  exit 1
-fi
-
 export DEBIAN_FRONTEND=noninteractive
 
 WEB_ROOT="/var/www/html"
