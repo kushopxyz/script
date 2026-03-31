@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-sudo -i
 # =========================
 # PRODUCTION NGINX SETUP
 # Ubuntu 24.04
