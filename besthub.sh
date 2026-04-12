@@ -55,15 +55,19 @@ service_exists() {
     --project="${PROJECT_ID}" >/dev/null 2>&1
 }
 
-register_discovered_workloads() {
-  local any_registered="false"
-  local locations
-  locations="$(gcloud apphub locations list --project="${PROJECT_ID}" --format='value(locationId)' 2>/dev/null || true)"
+# Chỉ quét 5 location để tăng tốc
+DISCOVERY_LOCATIONS=(
+  "global"
+  "us-central1"
+  "us-east1"
+  "asia-southeast1"
+  "europe-west1"
+)
 
-  {
-    printf '%s\n' "global"
-    printf '%s\n' "${locations}"
-  } | awk 'NF' | sort -u | while read -r loc; do
+register_discovered_workloads() {
+  local found_any="false"
+
+  for loc in "${DISCOVERY_LOCATIONS[@]}"; do
     info "Checking discovered workloads in location: ${loc}"
 
     local names
@@ -72,9 +76,9 @@ register_discovered_workloads() {
       --project="${PROJECT_ID}" \
       --format='value(name.basename())' 2>/dev/null || true)"
 
-    if [[ -z "${names}" ]]; then
-      continue
-    fi
+    [[ -z "${names}" ]] && continue
+
+    found_any="true"
 
     while read -r discovered_name; do
       [[ -z "${discovered_name}" ]] && continue
@@ -99,23 +103,21 @@ register_discovered_workloads() {
           --criticality-type=MISSION_CRITICAL \
           --environment-type=PRODUCTION >/dev/null 2>&1; then
         ok "Registered workload: ${workload_id}"
-        any_registered="true"
       else
         warn "Could not register workload: ${discovered_name}"
       fi
     done <<< "${names}"
   done
+
+  if [[ "${found_any}" == "false" ]]; then
+    warn "No discovered workloads found in selected locations."
+  fi
 }
 
 register_discovered_services() {
-  local any_registered="false"
-  local locations
-  locations="$(gcloud apphub locations list --project="${PROJECT_ID}" --format='value(locationId)' 2>/dev/null || true)"
+  local found_any="false"
 
-  {
-    printf '%s\n' "global"
-    printf '%s\n' "${locations}"
-  } | awk 'NF' | sort -u | while read -r loc; do
+  for loc in "${DISCOVERY_LOCATIONS[@]}"; do
     info "Checking discovered services in location: ${loc}"
 
     local names
@@ -124,9 +126,9 @@ register_discovered_services() {
       --project="${PROJECT_ID}" \
       --format='value(name.basename())' 2>/dev/null || true)"
 
-    if [[ -z "${names}" ]]; then
-      continue
-    fi
+    [[ -z "${names}" ]] && continue
+
+    found_any="true"
 
     while read -r discovered_name; do
       [[ -z "${discovered_name}" ]] && continue
@@ -151,19 +153,20 @@ register_discovered_services() {
           --criticality-type=MISSION_CRITICAL \
           --environment-type=PRODUCTION >/dev/null 2>&1; then
         ok "Registered service: ${service_id}"
-        any_registered="true"
       else
         warn "Could not register service: ${discovered_name}"
       fi
     done <<< "${names}"
   done
+
+  if [[ "${found_any}" == "false" ]]; then
+    warn "No discovered services found in selected locations."
+  fi
 }
 
 need_cmd gcloud
 need_cmd sed
 need_cmd tr
-need_cmd awk
-need_cmd sort
 need_cmd date
 
 PROJECT_ID="$(gcloud config get-value project 2>/dev/null || true)"
@@ -193,9 +196,7 @@ info "Project ID      : ${PROJECT_ID}"
 info "Project Number  : ${PROJECT_NUMBER}"
 info "Account         : ${ACCOUNT}"
 info "Application ID  : ${APP_ID}"
-
-info "Updating gcloud components (best effort)..."
-gcloud components update --quiet || warn "gcloud components update skipped or failed."
+info "Discovery scope : ${DISCOVERY_LOCATIONS[*]}"
 
 info "Setting default project..."
 gcloud config set project "${PROJECT_ID}" >/dev/null
@@ -219,17 +220,10 @@ else
   ok "Boundary created"
 fi
 
-info "Verifying boundary..."
-gcloud apphub boundary describe \
-  --project="${PROJECT_ID}" \
-  --location=global >/dev/null
-ok "Boundary verified"
-
 info "Granting App Hub roles to current account (best effort)..."
 safe_add_iam "${MEMBER}" "roles/apphub.admin"
 safe_add_iam "${MEMBER}" "roles/cloudhub.operator"
 
-info "Checking whether application already exists..."
 if app_exists; then
   ok "Application already exists: ${APP_ID}"
 else
@@ -252,45 +246,4 @@ info "Trying to auto-register discovered services..."
 register_discovered_services || true
 
 echo
-ok "App Hub single-project setup is complete."
-echo
-echo "Summary:"
-echo "  Project      : ${PROJECT_ID}"
-echo "  Account      : ${ACCOUNT}"
-echo "  Boundary     : projects/${PROJECT_ID}/locations/global/boundary"
-echo "  Application  : ${APP_ID}"
-echo
-
-info "Applications:"
-gcloud apphub applications list \
-  --location=global \
-  --project="${PROJECT_ID}" || true
-
-echo
-info "Registered services:"
-gcloud apphub applications services list \
-  --application="${APP_ID}" \
-  --location=global \
-  --project="${PROJECT_ID}" || true
-
-echo
-info "Registered workloads:"
-gcloud apphub applications workloads list \
-  --application="${APP_ID}" \
-  --location=global \
-  --project="${PROJECT_ID}" || true
-
-echo
-info "Discovered services in global:"
-gcloud apphub discovered-services list \
-  --location=global \
-  --project="${PROJECT_ID}" || true
-
-echo
-info "Discovered workloads in global:"
-gcloud apphub discovered-workloads list \
-  --location=global \
-  --project="${PROJECT_ID}" || true
-
-echo
-ok "Done."
+ok "App Hub setup is complete."
