@@ -596,8 +596,12 @@ write_files
 
 cd "${APP_DIR}"
 
-info "Deploy Hosting + Firestore + RTDB rules..."
-firebase deploy --only firestore,database,hosting --project "${PID}" --non-interactive
+info "Deploy Hosting + Firestore..."
+firebase deploy --only firestore,hosting --project "${PID}" --non-interactive
+
+# Deploy RTDB rules separately (may fail on fresh projects)
+info "Deploy RTDB rules..."
+firebase deploy --only database --project "${PID}" --non-interactive 2>/dev/null || warn "RTDB rules deploy skipped (RTDB may need manual init via Firebase Console)"
 
 echo ""
 echo "========================================="
