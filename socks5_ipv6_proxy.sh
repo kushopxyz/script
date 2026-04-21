@@ -390,6 +390,33 @@ GAIEOF
     log_ok "IPv6 preferred over IPv4 (gai.conf)"
 }
 
+# ======================== IPv6 SOURCE ROUTING ========================
+setup_ipv6_routing() {
+    log_info "Setting up per-address source routing..."
+
+    local gw iface
+    gw=$(ip -6 route show default | awk '{print $3}' | head -1)
+    iface=$(ip -6 route show default | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1)
+
+    if [[ -z "$gw" || -z "$iface" ]]; then
+        log_warn "Cannot detect IPv6 gateway. Source routing skipped."
+        return
+    fi
+
+    log_info "IPv6 gateway: ${gw} dev ${iface}"
+
+    local table_id=100
+    for ipv6 in "${USED_IPS[@]}"; do
+        table_id=$((table_id + 1))
+        ip -6 rule del from "$ipv6" table "$table_id" 2>/dev/null || true
+        ip -6 rule add from "$ipv6" table "$table_id" prio "$table_id"
+        ip -6 route replace default via "$gw" dev "$iface" src "$ipv6" table "$table_id" 2>/dev/null || true
+    done
+
+    IPV6_GW="$gw"
+    log_ok "Source routing configured for ${#USED_IPS[@]} addresses (tables 101-${table_id})"
+}
+
 # ======================== NDP PROXY ========================
 setup_ndp() {
     log_info "Configuring NDP proxy..."
@@ -425,10 +452,17 @@ sysctl -w net.ipv6.conf.${IPV6_IFACE}.accept_dad=0 &>/dev/null || true
 sysctl -w net.ipv6.conf.${IPV6_IFACE}.dad_transmits=0 &>/dev/null || true
 HEADER
 
+    local boot_table_id=100
+    local boot_gw
+    boot_gw=$(ip -6 route show default | awk '{print $3}' | head -1)
+
     for ipv6 in "${USED_IPS[@]}"; do
+        boot_table_id=$((boot_table_id + 1))
         cat >> /usr/local/bin/socks5-ipv6-setup.sh <<LINE
 ip -6 addr add ${ipv6}/64 dev ${IPV6_IFACE} nodad 2>/dev/null || ip -6 addr add ${ipv6}/64 dev ${IPV6_IFACE} 2>/dev/null || true
 ip -6 neigh add proxy ${ipv6} dev ${IPV6_IFACE} 2>/dev/null || true
+ip -6 rule add from ${ipv6} table ${boot_table_id} prio ${boot_table_id} 2>/dev/null || true
+ip -6 route replace default via ${boot_gw} dev ${IPV6_IFACE} src ${ipv6} table ${boot_table_id} 2>/dev/null || true
 LINE
     done
     chmod +x /usr/local/bin/socks5-ipv6-setup.sh
@@ -518,22 +552,35 @@ setup_watchdog() {
 
     # Watchdog reads proxies.conf, checks IPv6 + service health,
     # and uses systemctl restart for dead proxies (not background spawning)
+    local wd_gw
+    wd_gw=$(ip -6 route show default | awk '{print $3}' | head -1)
+
     cat > /usr/local/bin/socks5-ipv6-watchdog.sh <<WDEOF
 #!/bin/bash
-# Auto-generated watchdog — recovers lost IPv6 and restarts dead proxy units
+# Auto-generated watchdog — recovers lost IPv6, routing rules, and restarts dead proxy units
 IFACE="${IPV6_IFACE}"
 CONF="${WORK_DIR}/proxies.conf"
+GW="${wd_gw}"
 RECOVERED=0
+TABLE_ID=100
 
 [[ -f "\$CONF" ]] || exit 0
 
 while IFS='|' read -r port user pass ipv6; do
+    TABLE_ID=\$((TABLE_ID + 1))
     # Check and re-add missing IPv6 address
     if ! ip -6 addr show dev "\$IFACE" | grep -q "\$ipv6"; then
         ip -6 addr add "\${ipv6}/64" dev "\$IFACE" nodad 2>/dev/null || true
         ip -6 neigh add proxy "\$ipv6" dev "\$IFACE" 2>/dev/null || true
         RECOVERED=\$((RECOVERED + 1))
         logger -t socks5-watchdog "Recovered IPv6: \$ipv6"
+    fi
+    # Check and re-add missing routing rule
+    if ! ip -6 rule show | grep -q "from \$ipv6"; then
+        ip -6 rule add from "\$ipv6" table "\$TABLE_ID" prio "\$TABLE_ID" 2>/dev/null || true
+        ip -6 route replace default via "\$GW" dev "\$IFACE" src "\$ipv6" table "\$TABLE_ID" 2>/dev/null || true
+        RECOVERED=\$((RECOVERED + 1))
+        logger -t socks5-watchdog "Recovered route for: \$ipv6"
     fi
     # Check and restart dead proxy service
     if ! systemctl is-active --quiet "microsocks@\${port}.service" 2>/dev/null; then
@@ -619,6 +666,13 @@ remove_all() {
         done < /usr/local/bin/socks5-ipv6-setup.sh
         log_ok "IPv6 addresses removed"
     fi
+
+    # Remove source routing rules (tables 101-600)
+    for tid in $(seq 101 600); do
+        ip -6 rule del table "$tid" 2>/dev/null || true
+        ip -6 route flush table "$tid" 2>/dev/null || true
+    done
+    log_ok "Source routing rules removed"
 
     # Remove systemd units
     systemctl disable --now socks5-ipv6-setup.service 2>/dev/null || true
@@ -803,9 +857,10 @@ main() {
     USED_IPS=()
     setup_proxies
 
-    # Step 6: IPv6 preference + NDP + persistence + firewall
+    # Step 6: IPv6 preference + routing + NDP + persistence + firewall
     echo ""
     setup_ipv6_preference
+    setup_ipv6_routing
     setup_ndp
     make_persistent
     configure_firewall
