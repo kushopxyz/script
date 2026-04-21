@@ -120,9 +120,12 @@ ensure_ipv6() {
     local ra_output="" gw="" prefix=""
 
     if command -v rdisc6 &>/dev/null; then
-        ra_output=$(rdisc6 -w 8000 "$iface" 2>/dev/null || true)
+        log_info "Running rdisc6 on ${iface}..."
+        ra_output=$(rdisc6 "$iface" 2>&1 || true)
         gw=$(echo "$ra_output" | grep -oP 'from \K[0-9a-f:]+' | head -1 || true)
         prefix=$(echo "$ra_output" | grep -oP 'Prefix\s+:\s+\K[0-9a-f:]+::/[0-9]+' | head -1 || true)
+        [[ -n "$gw" ]] && log_info "Router found: ${gw} prefix: ${prefix:-none}"
+        [[ -z "$gw" ]] && log_warn "No router responded to rdisc6"
     fi
 
     # Wait up to 10s for SLAAC to assign address
