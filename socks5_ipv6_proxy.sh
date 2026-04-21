@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # IPv6 SOCKS5 Proxy Auto-Setup Script
-# Version: 3.0.0
-#
-# Handles: Linode, Vultr, DigitalOcean, Hetzner, and any VPS with a /64 IPv6
-# Engine:  microsocks + systemd (each proxy = supervised service)
+# Version: 2.0.2
+# Creates multiple SOCKS5 proxies, each with a unique public IPv6 address
+# Supports: Ubuntu, Debian, CentOS, AlmaLinux, Rocky Linux
+# Uses: microsocks (lightweight, proven IPv6 support)
 #
 # Usage:
 #   ./socks5_ipv6_proxy.sh              # Auto-detect and create proxies
@@ -12,30 +12,44 @@
 #   ./socks5_ipv6_proxy.sh -p 20000     # Ports start at 20000
 #   ./socks5_ipv6_proxy.sh -r           # Remove everything
 # ==============================================================================
-SCRIPT_VERSION="3.0.0"
+SCRIPT_VERSION="2.0.9"
 
 set -Eeuo pipefail
 trap 'echo -e "\033[0;31m[ERROR]\033[0m Line $LINENO: $BASH_COMMAND" >&2' ERR
 
-# ---- Self-fix CRLF (script may have been edited on Windows) ----
-if grep -qP '\r' "$0" 2>/dev/null; then
-    sed -i 's/\r$//' "$0"
-    exec bash "$0" "$@"
-fi
-
 # ======================== CONFIGURATION ========================
 WORK_DIR="/root/socks5-ipv6"
-INSTANCES_DIR="${WORK_DIR}/instances"
 OUTPUT_FILE="/root/socks5_ipv6_proxies.txt"
 START_PORT=10000
+PID_DIR="/run/socks5-ipv6"
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m'
 
+# ======================== HELPERS ========================
 log_info()  { echo -e "${BLUE}[INFO]${NC} $1"; }
 log_ok()    { echo -e "${GREEN}[ OK ]${NC} $1"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[FAIL]${NC} $1"; exit 1; }
+
+bump_ulimits() {
+    # Raise fd and process limits to handle hundreds of proxies
+    local cur_nofile cur_nproc
+    cur_nofile=$(ulimit -n 2>/dev/null || echo 1024)
+    cur_nproc=$(ulimit -u 2>/dev/null || echo 4096)
+    if (( cur_nofile < 65535 )); then
+        ulimit -n 65535 2>/dev/null || ulimit -n 32768 2>/dev/null || true
+        log_info "Raised fd limit: ${cur_nofile} -> $(ulimit -n)"
+    fi
+    if (( cur_nproc < 32768 )); then
+        ulimit -u 32768 2>/dev/null || true
+    fi
+}
 
 check_root() {
     [[ $EUID -eq 0 ]] || log_error "This script must be run as root/sudo."
@@ -61,14 +75,14 @@ install_deps() {
     case "$PKG" in
         apt)
             apt-get update -qq >/dev/null 2>&1
-            apt-get install -y -qq curl net-tools openssl python3 iproute2 ndisc6 >/dev/null 2>&1
-            apt-get install -y -qq microsocks >/dev/null 2>&1 || true
+            apt-get install -y -qq curl net-tools openssl python3 iproute2 microsocks >/dev/null 2>&1
             ;;
         dnf)
-            dnf install -y -q curl net-tools openssl python3 iproute gcc git make ndisc6 >/dev/null 2>&1 || true
+            dnf install -y -q curl net-tools openssl python3 iproute gcc git make >/dev/null 2>&1
             ;;
     esac
 
+    # Verify microsocks is available, compile if not
     if ! command -v microsocks &>/dev/null; then
         log_info "Building microsocks from source..."
         local build_dir="/tmp/microsocks-build"
@@ -81,116 +95,28 @@ install_deps() {
     fi
 
     command -v microsocks &>/dev/null || log_error "Failed to install microsocks."
-    MICROSOCKS_BIN=$(command -v microsocks)
-    log_ok "Dependencies ready (microsocks: ${MICROSOCKS_BIN})"
+    log_ok "Dependencies ready (microsocks: $(which microsocks))"
 }
 
-# ======================== ENSURE IPv6 IS UP ========================
-ensure_ipv6() {
-    log_info "Ensuring IPv6 connectivity..."
-
-    # Find the main network interface (has link-local or default route)
-    local iface
-    iface=$(ip -6 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1)
-    if [[ -z "$iface" ]]; then
-        iface=$(ip -o link show up | awk -F': ' '!/lo/{print $2}' | head -1)
-    fi
-    [[ -n "$iface" ]] || log_error "No active network interface found."
-
-    # Enable SLAAC (accept_ra=2 works even with forwarding=1)
-    sysctl -w net.ipv6.conf.all.accept_ra=2 &>/dev/null || true
-    sysctl -w "net.ipv6.conf.${iface}.accept_ra=2" &>/dev/null || true
-    sysctl -w "net.ipv6.conf.${iface}.autoconf=1" &>/dev/null || true
-    sysctl -w "net.ipv6.conf.${iface}.disable_ipv6=0" &>/dev/null || true
-
-    # Check if we already have a global IPv6
-    if ip -6 addr show dev "$iface" scope global 2>/dev/null | grep -q "inet6"; then
-        log_ok "Global IPv6 already present on ${iface}"
-        return 0
-    fi
-
-    # No global IPv6 — try router discovery
-    log_info "No global IPv6 found. Trying router discovery on ${iface}..."
-
-    # Install ndisc6 if not available (install_deps runs later)
-    if ! command -v rdisc6 &>/dev/null; then
-        apt-get install -y -qq ndisc6 >/dev/null 2>&1 || dnf install -y -q ndisc6 >/dev/null 2>&1 || true
-    fi
-
-    local ra_output="" gw="" prefix=""
-
-    if command -v rdisc6 &>/dev/null; then
-        log_info "Running rdisc6 on ${iface}..."
-        ra_output=$(rdisc6 "$iface" 2>&1 || true)
-        gw=$(echo "$ra_output" | grep -oP 'from \K[0-9a-f:]+' | head -1 || true)
-        prefix=$(echo "$ra_output" | grep -oP 'Prefix\s+:\s+\K[0-9a-f:]+::/[0-9]+' | head -1 || true)
-        [[ -n "$gw" ]] && log_info "Router found: ${gw} prefix: ${prefix:-none}"
-        [[ -z "$gw" ]] && log_warn "No router responded to rdisc6"
-    fi
-
-    # Wait up to 10s for SLAAC to assign address
-    local waited=0
-    while (( waited < 10 )); do
-        if ip -6 addr show dev "$iface" scope global 2>/dev/null | grep -q "inet6"; then
-            log_ok "IPv6 obtained via SLAAC on ${iface}"
-            if ! ip -6 route show default 2>/dev/null | grep -q "default"; then
-                [[ -n "$gw" ]] && ip -6 route add default via "$gw" dev "$iface" 2>/dev/null || true
-            fi
-            return 0
-        fi
-        sleep 1
-        waited=$((waited + 1))
-    done
-
-    # SLAAC auto-assign failed — manually construct address from prefix + MAC
-    if [[ -n "$prefix" && -n "$gw" ]]; then
-        log_info "SLAAC auto-assign failed. Building address from prefix ${prefix}..."
-
-        # Get MAC address and compute EUI-64
-        local mac ll_addr
-        mac=$(ip link show dev "$iface" | awk '/ether/{print $2}')
-        if [[ -n "$mac" ]]; then
-            ll_addr=$(python3 -c "
-import ipaddress
-mac = '${mac}'.split(':')
-mac[0] = format(int(mac[0], 16) ^ 0x02, '02x')
-eui = mac[0]+mac[1] + ':' + mac[2] + 'ff:fe' + mac[3] + ':' + mac[4]+mac[5]
-prefix = '${prefix%%/*}'
-addr = prefix.rstrip(':') + ':' + eui
-print(str(ipaddress.IPv6Address(addr)))
-" 2>/dev/null || true)
-
-            if [[ -n "$ll_addr" ]]; then
-                ip -6 addr add "${ll_addr}/64" dev "$iface" 2>/dev/null || true
-                ip -6 route add default via "$gw" dev "$iface" 2>/dev/null || true
-                sleep 2
-                if ip -6 addr show dev "$iface" scope global 2>/dev/null | grep -q "inet6"; then
-                    log_ok "IPv6 manually assigned: ${ll_addr}"
-                    return 0
-                fi
-            fi
-        fi
-    fi
-
-    # Last resort: try adding gateway and wait
-    if [[ -n "$gw" ]]; then
-        ip -6 route add default via "$gw" dev "$iface" 2>/dev/null || true
-        sleep 5
-        if ip -6 addr show dev "$iface" scope global 2>/dev/null | grep -q "inet6"; then
-            log_ok "IPv6 obtained after adding gateway"
-            return 0
-        fi
-    fi
-
-    log_error "Cannot obtain global IPv6 on ${iface}.
-  Please ensure IPv6 is enabled in your VPS provider dashboard and reboot."
-}
-
-# ======================== IPv6 DETECTION ========================
+# ======================== IPv6 DETECTION & VALIDATION ========================
 detect_ipv6() {
     log_info "Detecting IPv6 configuration..."
 
     command -v python3 &>/dev/null || log_error "python3 is required but not found."
+
+    local ipv6_line
+    ipv6_line=$(ip -6 addr show scope global 2>/dev/null | grep -oP 'inet6 \K[0-9a-f:]+/[0-9]+' | head -1 || true)
+
+    if [[ -z "$ipv6_line" ]]; then
+        log_error "No global IPv6 address found. This VPS does not have an IPv6 subnet."
+    fi
+
+    IPV6_ADDR="${ipv6_line%%/*}"
+    IPV6_PREFIX="${ipv6_line##*/}"
+
+    if (( IPV6_PREFIX > 64 )); then
+        log_error "IPv6 prefix /${IPV6_PREFIX} is too small. Need /64 or larger."
+    fi
 
     IPV6_IFACE=$(ip -6 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1)
     if [[ -z "$IPV6_IFACE" ]]; then
@@ -198,34 +124,15 @@ detect_ipv6() {
     fi
     [[ -n "$IPV6_IFACE" ]] || log_error "Cannot detect IPv6 network interface."
 
-    local all_addrs best_line
-    all_addrs=$(ip -6 addr show dev "$IPV6_IFACE" scope global 2>/dev/null \
-        | grep -oP 'inet6 \K[0-9a-f:]+/[0-9]+' || true)
-    [[ -n "$all_addrs" ]] || log_error "No global IPv6 address found on ${IPV6_IFACE}."
-
-    best_line=$(echo "$all_addrs" | awk -F'/' '{print $2, $0}' | sort -n | awk '{print $2}' | head -1)
-    local best_prefix="${best_line##*/}"
-
-    if (( best_prefix > 64 )); then
-        log_error "No usable IPv6 subnet on ${IPV6_IFACE} (smallest prefix: /${best_prefix})."
-    fi
-
-    IPV6_ADDR="${best_line%%/*}"
-    IPV6_PREFIX="$best_prefix"
-
     IPV6_NET=$(python3 -c "
 import ipaddress
 net = ipaddress.IPv6Network('${IPV6_ADDR}/${IPV6_PREFIX}', strict=False)
 print(str(net.network_address))
 ")
 
-    # Detect gateway
-    IPV6_GW=$(ip -6 route show default | awk '{print $3}' | head -1)
-
-    log_ok "Interface: ${IPV6_IFACE}"
     log_ok "Address  : ${IPV6_ADDR}/${IPV6_PREFIX}"
     log_ok "Subnet   : ${IPV6_NET}/${IPV6_PREFIX}"
-    log_ok "Gateway  : ${IPV6_GW:-unknown}"
+    log_ok "Interface: ${IPV6_IFACE}"
 }
 
 check_ipv6_connectivity() {
@@ -233,9 +140,32 @@ check_ipv6_connectivity() {
     if ping -6 -c 1 -W 5 google.com &>/dev/null; then
         log_ok "IPv6 internet reachable"
     elif ping -6 -c 1 -W 5 2001:4860:4860::8888 &>/dev/null; then
-        log_ok "IPv6 connectivity OK (DNS may not resolve AAAA)"
+        log_ok "IPv6 connectivity OK (ICMP blocked but route exists)"
     else
-        log_warn "IPv6 ping failed — firewall may block ICMP, continuing..."
+        log_warn "IPv6 ping failed. Continuing (firewall may block ICMP)..."
+    fi
+}
+
+test_ipv6_assignment() {
+    log_info "Testing IPv6 address assignment + outgoing connectivity..."
+
+    local test_ip
+    test_ip=$(generate_random_ipv6)
+    ip -6 addr add "${test_ip}/128" dev "$IPV6_IFACE" 2>/dev/null || log_error "Cannot assign IPv6 to ${IPV6_IFACE}."
+    sleep 1
+
+    # Test actual TCP outgoing from this IPv6
+    local result
+    result=$(curl -s -m 10 --interface "$test_ip" https://api64.ipify.org 2>/dev/null || true)
+
+    ip -6 addr del "${test_ip}/128" dev "$IPV6_IFACE" 2>/dev/null || true
+
+    if [[ "$result" == "$test_ip" ]]; then
+        log_ok "IPv6 ${test_ip} is routable and shows correct outgoing IP"
+    elif [[ -n "$result" ]]; then
+        log_warn "IPv6 assigned but outgoing shows: ${result} (NDP proxy may help)"
+    else
+        log_warn "IPv6 connectivity test inconclusive (will configure NDP proxy)"
     fi
 }
 
@@ -256,6 +186,7 @@ calculate_proxy_count() {
     TOTAL_RAM=$(free -m | awk '/^Mem:/{print $2}')
     TOTAL_CORES=$(nproc 2>/dev/null || echo 1)
 
+    # microsocks uses ~0.5MB per instance - very lightweight
     if   (( TOTAL_RAM < 512  )); then PROXY_COUNT=5
     elif (( TOTAL_RAM < 1024 )); then PROXY_COUNT=50
     elif (( TOTAL_RAM < 2048 )); then PROXY_COUNT=100
@@ -268,45 +199,34 @@ calculate_proxy_count() {
     log_info "Creating: ${PROXY_COUNT} proxies"
 }
 
-# ======================== FORCE IPv6 PREFERENCE ========================
-setup_ipv6_preference() {
-    log_info "Configuring system to prefer IPv6 for DNS resolution..."
-
-    cat > /etc/gai.conf <<'EOF'
-label  ::1/128       0
-label  ::/0          1
-label  2002::/16     2
-label ::/96          3
-label ::ffff:0:0/96  4
-precedence  ::1/128       50
-precedence  ::/0          40
-precedence  2002::/16     30
-precedence ::/96          20
-precedence ::ffff:0:0/96  10
-EOF
-
-    log_ok "IPv6 preferred over IPv4 (gai.conf)"
-}
-
 # ======================== CREATE PROXIES ========================
 setup_proxies() {
+    # Clean previous installation if exists
     if [[ -d "$WORK_DIR" ]]; then
-        log_warn "Previous installation found. Cleaning..."
+        log_warn "Previous installation found. Stopping..."
         stop_all_proxies
         rm -rf "$WORK_DIR"
     fi
 
-    mkdir -p "$WORK_DIR" "$INSTANCES_DIR"
+    mkdir -p "$WORK_DIR" "$PID_DIR"
 
-    PUBLIC_IPV4=$(curl -s -4 -m 5 ifconfig.me 2>/dev/null || curl -s -4 -m 5 api.ipify.org 2>/dev/null || echo "N/A")
+    local public_ipv4
+    public_ipv4=$(curl -s -4 -m 5 ifconfig.me 2>/dev/null || curl -s -4 -m 5 api.ipify.org 2>/dev/null || echo "N/A")
+    PUBLIC_IPV4="$public_ipv4"
 
+    # ---- Proxy data file (used by systemd to start proxies) ----
+    # Format: PORT|USER|PASS|IPV6
     > "$WORK_DIR/proxies.conf"
+
+    # ---- Output files ----
     > "${WORK_DIR}/url.txt"
     > "${WORK_DIR}/ipport.txt"
 
+    # ---- Disable DAD (Duplicate Address Detection) to avoid tentative state ----
     sysctl -w "net.ipv6.conf.${IPV6_IFACE}.accept_dad=0" &>/dev/null || true
     sysctl -w "net.ipv6.conf.${IPV6_IFACE}.dad_transmits=0" &>/dev/null || true
 
+    # ---- Generate proxies ----
     USED_IPS=()
 
     for ((i = 1; i <= PROXY_COUNT; i++)); do
@@ -326,57 +246,113 @@ setup_proxies() {
         pass=$(openssl rand -hex 4)
         port=$(( START_PORT + i - 1 ))
 
-        if ip -6 addr add "${ipv6}/64" dev "$IPV6_IFACE" nodad 2>/dev/null || \
-           ip -6 addr add "${ipv6}/64" dev "$IPV6_IFACE" 2>/dev/null; then
+        # Assign IPv6 to host interface (nodad = skip tentative state)
+        ip -6 addr add "${ipv6}/128" dev "$IPV6_IFACE" nodad 2>/dev/null || \
+            ip -6 addr add "${ipv6}/128" dev "$IPV6_IFACE" 2>/dev/null || true
 
-            echo "${port}|${user}|${pass}|${ipv6}" >> "$WORK_DIR/proxies.conf"
+        # Save proxy config
+        echo "${port}|${user}|${pass}|${ipv6}" >> "$WORK_DIR/proxies.conf"
 
-            printf 'PORT=%s\nSOCKS_USER=%s\nSOCKS_PASS=%s\nIPV6=%s\n' \
-                "$port" "$user" "$pass" "$ipv6" > "${INSTANCES_DIR}/${port}.env"
+        # Save to output files (multiple formats)
+        echo "socks5://${user}:${pass}@${public_ipv4}:${port}" >> "${WORK_DIR}/url.txt"
+        echo "${public_ipv4}:${port}:${user}:${pass}" >> "${WORK_DIR}/ipport.txt"
 
-            echo "socks5://${user}:${pass}@${PUBLIC_IPV4}:${port}" >> "${WORK_DIR}/url.txt"
-            echo "socks5://${PUBLIC_IPV4}:${port}:${user}:${pass}" >> "${WORK_DIR}/ipport.txt"
-            printf "  ${GREEN}[%3d/%d]${NC} :%d -> %s\n" "$i" "$PROXY_COUNT" "$port" "$ipv6"
-        else
-            printf "  ${RED}[%3d/%d]${NC} :%d -> %s (FAILED)\n" "$i" "$PROXY_COUNT" "$port" "$ipv6"
-        fi
+        # Progress
+        printf "  ${GREEN}[%3d/%d]${NC} :%d -> %s\n" "$i" "$PROXY_COUNT" "$port" "$ipv6"
     done
 
-    PROXY_COUNT=$(wc -l < "$WORK_DIR/proxies.conf")
-
+    # Combine into main output file
     {
-        echo "# ===== socks5://user:pass@ip:port ====="
+        echo "# ===== Format: socks5://user:pass@ip:port ====="
         cat "${WORK_DIR}/url.txt"
         echo ""
-        echo "# ===== socks5://IP:Port:User:Pass ====="
+        echo "# ===== Format: IP:Port:Username:Password ====="
         cat "${WORK_DIR}/ipport.txt"
     } > "$OUTPUT_FILE"
 
+    # Wait for all IPv6 addresses to be fully ready
     log_info "Waiting for IPv6 addresses to settle..."
     sleep 3
+
 }
 
-# ======================== SOURCE ROUTING ========================
-setup_ipv6_routing() {
-    log_info "Setting up per-address source routing..."
+# ======================== START / STOP PROXIES ========================
+start_all_proxies() {
+    log_info "Starting ${PROXY_COUNT} microsocks instances..."
+    mkdir -p "$PID_DIR"
+    > "$PID_DIR/pids"
+    local count=0
 
-    if [[ -z "${IPV6_GW:-}" ]]; then
-        IPV6_GW=$(ip -6 route show default | awk '{print $3}' | head -1)
+    # Phase 1: Spawn all processes (don't check yet)
+    while IFS='|' read -r port user pass ipv6; do
+        microsocks -p "$port" -u "$user" -P "$pass" -b "$ipv6" >/dev/null 2>&1 &
+        echo $! >> "$PID_DIR/pids"
+        count=$((count + 1))
+        if (( count % 50 == 0 )); then
+            log_info "  ... spawned ${count}/${PROXY_COUNT}"
+            sleep 0.5
+        fi
+    done < "$WORK_DIR/proxies.conf"
+    log_info "All ${count} processes spawned, waiting 3s for them to bind..."
+    sleep 3
+
+    # Phase 2: Check which ports are actually listening
+    local listening=0 failed=0
+    local failed_ports=""
+    while IFS='|' read -r port user pass ipv6; do
+        if ss -tlnp 2>/dev/null | grep -q ":${port} "; then
+            listening=$((listening + 1))
+        else
+            failed=$((failed + 1))
+            failed_ports="${failed_ports} ${port}|${user}|${pass}|${ipv6}"
+        fi
+    done < "$WORK_DIR/proxies.conf"
+
+    # Phase 3: Retry failed ones
+    if (( failed > 0 )); then
+        log_warn "${listening} listening, ${failed} dead — retrying..."
+        sleep 2
+        local retried=0
+        for entry in $failed_ports; do
+            IFS='|' read -r port user pass ipv6 <<< "$entry"
+            microsocks -p "$port" -u "$user" -P "$pass" -b "$ipv6" >/dev/null 2>&1 &
+            retried=$((retried + 1))
+        done
+        sleep 2
+        # Recount
+        listening=0 failed=0
+        while IFS='|' read -r port user pass ipv6; do
+            if ss -tlnp 2>/dev/null | grep -q ":${port} "; then
+                listening=$((listening + 1))
+            else
+                failed=$((failed + 1))
+            fi
+        done < "$WORK_DIR/proxies.conf"
+        log_info "After retry: ${listening} listening, ${failed} still dead"
     fi
-    if [[ -z "${IPV6_GW:-}" ]]; then
-        log_warn "No IPv6 gateway — source routing skipped."
-        return
+
+    ACTUAL_STARTED=$listening
+    ACTUAL_FAILED=$failed
+
+    if (( failed > 0 )); then
+        log_warn "${listening}/${PROXY_COUNT} running (${failed} failed — watchdog will keep retrying)"
+    else
+        log_ok "All ${listening} proxies running"
     fi
+}
 
-    local table_id=100
-    for ipv6 in "${USED_IPS[@]}"; do
-        table_id=$((table_id + 1))
-        ip -6 rule del from "$ipv6" table "$table_id" 2>/dev/null || true
-        ip -6 rule add from "$ipv6" table "$table_id" prio "$table_id"
-        ip -6 route replace default via "$IPV6_GW" dev "$IPV6_IFACE" src "$ipv6" table "$table_id" 2>/dev/null || true
-    done
-
-    log_ok "Source routing: ${#USED_IPS[@]} addresses (tables 101-${table_id})"
+stop_all_proxies() {
+    # Kill by PID file first
+    if [[ -f "$PID_DIR/pids" ]]; then
+        while read -r pid; do
+            kill "$pid" 2>/dev/null || true
+        done < "$PID_DIR/pids"
+        rm -f "$PID_DIR/pids"
+    fi
+    # Fallback: kill all microsocks
+    pkill -f "microsocks -p" 2>/dev/null || true
+    sleep 1
+    pkill -9 -f "microsocks -p" 2>/dev/null || true
 }
 
 # ======================== NDP PROXY ========================
@@ -389,8 +365,6 @@ setup_ndp() {
     cat > /etc/sysctl.d/99-socks5-ndp.conf <<SYSCTL
 net.ipv6.conf.all.proxy_ndp=1
 net.ipv6.conf.${IPV6_IFACE}.proxy_ndp=1
-net.ipv6.conf.all.accept_ra=2
-net.ipv6.conf.${IPV6_IFACE}.accept_ra=2
 SYSCTL
 
     for ipv6 in "${USED_IPS[@]}"; do
@@ -400,176 +374,175 @@ SYSCTL
     log_ok "NDP proxy enabled for ${#USED_IPS[@]} addresses"
 }
 
-# ======================== START / STOP ========================
-start_all_proxies() {
-    log_info "Starting ${PROXY_COUNT} microsocks services..."
-
-    local -a units=()
-    while IFS='|' read -r port _user _pass _ipv6; do
-        units+=("microsocks@${port}.service")
-    done < "$WORK_DIR/proxies.conf"
-
-    (( ${#units[@]} > 0 )) || log_error "No proxies to start."
-
-    systemctl enable "${units[@]}" &>/dev/null 2>&1
-    systemctl start "${units[@]}" 2>/dev/null || true
-
-    sleep 3
-
-    local listening=0 failed=0
-    for unit in "${units[@]}"; do
-        if systemctl is-active --quiet "$unit" 2>/dev/null; then
-            listening=$((listening + 1))
-        else
-            failed=$((failed + 1))
-        fi
-    done
-
-    ACTUAL_STARTED=$listening
-    ACTUAL_FAILED=$failed
-
-    if (( failed > 0 )); then
-        log_warn "${listening}/${#units[@]} running (${failed} failed — systemd will auto-restart)"
-    else
-        log_ok "All ${listening} proxies running"
-    fi
-}
-
-stop_all_proxies() {
-    if [[ -f "$WORK_DIR/proxies.conf" ]]; then
-        local -a units=()
-        while IFS='|' read -r port _user _pass _ipv6; do
-            units+=("microsocks@${port}.service")
-        done < "$WORK_DIR/proxies.conf"
-        if (( ${#units[@]} > 0 )); then
-            systemctl stop "${units[@]}" 2>/dev/null || true
-            systemctl disable "${units[@]}" 2>/dev/null || true
-        fi
-    fi
-    pkill -f "microsocks -p" 2>/dev/null || true
-    sleep 1
-    pkill -9 -f "microsocks -p" 2>/dev/null || true
-}
-
 # ======================== PERSISTENCE ========================
 make_persistent() {
     log_info "Making configuration persistent..."
 
-    local gw
-    gw=$(ip -6 route show default | awk '{print $3}' | head -1)
+    # ---------- Layer 1: Network config (netplan/ifcfg) ----------
+    write_network_config
 
-    # ---- Boot script ----
+    # ---------- Layer 2: Boot script for IPv6 + NDP ----------
     cat > /usr/local/bin/socks5-ipv6-setup.sh <<HEADER
 #!/bin/bash
-# Auto-generated by socks5_ipv6_proxy.sh v${SCRIPT_VERSION}
-sysctl -w net.ipv6.conf.all.accept_ra=2 &>/dev/null || true
-sysctl -w net.ipv6.conf.${IPV6_IFACE}.accept_ra=2 &>/dev/null || true
+# Auto-generated by socks5_ipv6_proxy.sh
+# Disable DAD to avoid tentative state
 sysctl -w net.ipv6.conf.${IPV6_IFACE}.accept_dad=0 &>/dev/null || true
 sysctl -w net.ipv6.conf.${IPV6_IFACE}.dad_transmits=0 &>/dev/null || true
-sleep 5
 HEADER
 
-    local table_id=100
     for ipv6 in "${USED_IPS[@]}"; do
-        table_id=$((table_id + 1))
         cat >> /usr/local/bin/socks5-ipv6-setup.sh <<LINE
-ip -6 addr add ${ipv6}/64 dev ${IPV6_IFACE} nodad 2>/dev/null || true
+ip -6 addr add ${ipv6}/128 dev ${IPV6_IFACE} nodad 2>/dev/null || ip -6 addr add ${ipv6}/128 dev ${IPV6_IFACE} 2>/dev/null || true
 ip -6 neigh add proxy ${ipv6} dev ${IPV6_IFACE} 2>/dev/null || true
-ip -6 rule add from ${ipv6} table ${table_id} prio ${table_id} 2>/dev/null || true
-ip -6 route replace default via ${gw} dev ${IPV6_IFACE} src ${ipv6} table ${table_id} 2>/dev/null || true
 LINE
     done
     chmod +x /usr/local/bin/socks5-ipv6-setup.sh
 
-    # ---- Systemd: IPv6 setup ----
-    cat > /etc/systemd/system/socks5-ipv6-setup.service <<UNIT
+    # ---------- Layer 3: Systemd service for proxies ----------
+    cat > /usr/local/bin/socks5-ipv6-start.sh <<'STARTEOF'
+#!/bin/bash
+# Start all microsocks proxies from config
+CONF="/root/socks5-ipv6/proxies.conf"
+PIDFILE="/run/socks5-ipv6/pids"
+[[ -f "$CONF" ]] || exit 1
+mkdir -p /run/socks5-ipv6
+
+# Raise limits
+ulimit -n 65535 2>/dev/null || ulimit -n 32768 2>/dev/null || true
+
+COUNT=0
+while IFS='|' read -r port user pass ipv6; do
+    microsocks -p "$port" -u "$user" -P "$pass" -b "$ipv6" >/dev/null 2>&1 &
+    echo $! >> "$PIDFILE"
+    sleep 0.1
+    COUNT=$((COUNT + 1))
+    # Pause every 50 to let OS settle
+    if (( COUNT % 50 == 0 )); then
+        sleep 1
+    fi
+done < "$CONF"
+STARTEOF
+    chmod +x /usr/local/bin/socks5-ipv6-start.sh
+
+    cat > /etc/systemd/system/socks5-ipv6.service <<UNIT
 [Unit]
-Description=SOCKS5 IPv6 Address Setup
+Description=SOCKS5 IPv6 Proxy Service
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/local/bin/socks5-ipv6-setup.sh
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-
-    # ---- Systemd: microsocks template ----
-    cat > /etc/systemd/system/microsocks@.service <<UNIT
-[Unit]
-Description=MicroSocks SOCKS5 proxy on port %i
-After=socks5-ipv6-setup.service
-Requires=socks5-ipv6-setup.service
-
-[Service]
-Type=simple
-EnvironmentFile=${INSTANCES_DIR}/%i.env
-ExecStart=${MICROSOCKS_BIN} -p \${PORT} -u \${SOCKS_USER} -P \${SOCKS_PASS} -b \${IPV6}
-Restart=always
-RestartSec=2
-LimitNOFILE=65535
+ExecStartPre=/usr/local/bin/socks5-ipv6-setup.sh
+ExecStart=/usr/local/bin/socks5-ipv6-start.sh
+ExecStop=/bin/bash -c 'pkill -f "microsocks -p" || true'
 
 [Install]
 WantedBy=multi-user.target
 UNIT
 
     systemctl daemon-reload
-    systemctl enable socks5-ipv6-setup.service &>/dev/null
+    systemctl enable socks5-ipv6.service &>/dev/null
 
-    # ---- Watchdog ----
+    # ---------- Layer 4: Watchdog ----------
     setup_watchdog
 
-    log_ok "Persistence configured"
+    log_ok "4-layer persistence enabled"
+}
+
+# ======================== NETWORK CONFIG ========================
+write_network_config() {
+    log_info "Writing IPv6 to network config..."
+
+    if command -v netplan &>/dev/null; then
+        local netplan_file="/etc/netplan/60-socks5-ipv6.yaml"
+        cat > "$netplan_file" <<NETPLAN
+# Auto-generated by socks5_ipv6_proxy.sh - DO NOT EDIT
+network:
+  version: 2
+  ethernets:
+    ${IPV6_IFACE}:
+      addresses:
+NETPLAN
+        for ipv6 in "${USED_IPS[@]}"; do
+            echo "        - \"${ipv6}/128\"" >> "$netplan_file"
+        done
+        chmod 600 "$netplan_file"
+        netplan apply 2>/dev/null || log_warn "netplan apply failed (IPv6 added via ip cmd)"
+        log_ok "Netplan config: ${netplan_file}"
+
+    elif [[ -d /etc/sysconfig/network-scripts ]]; then
+        local ifcfg_file="/etc/sysconfig/network-scripts/ifcfg-${IPV6_IFACE}-socks5-ipv6"
+        cat > "$ifcfg_file" <<IFCFG
+# Auto-generated by socks5_ipv6_proxy.sh
+DEVICE=${IPV6_IFACE}
+IPV6ADDR_SECONDARIES="$(printf '%s/128 ' "${USED_IPS[@]}")"
+IFCFG
+        log_ok "ifcfg config: ${ifcfg_file}"
+
+    elif [[ -d /etc/network/interfaces.d ]]; then
+        local iface_file="/etc/network/interfaces.d/socks5-ipv6"
+        > "$iface_file"
+        for ipv6 in "${USED_IPS[@]}"; do
+            echo "iface ${IPV6_IFACE} inet6 static" >> "$iface_file"
+            echo "    address ${ipv6}/128" >> "$iface_file"
+            echo "" >> "$iface_file"
+        done
+        log_ok "interfaces.d config: ${iface_file}"
+
+    else
+        log_warn "Unknown network config. IPv6 relies on boot script + watchdog."
+    fi
 }
 
 # ======================== WATCHDOG ========================
 setup_watchdog() {
-    local gw
-    gw=$(ip -6 route show default | awk '{print $3}' | head -1)
+    log_info "Setting up watchdog..."
 
-    cat > /usr/local/bin/socks5-ipv6-watchdog.sh <<WDEOF
+    cat > /usr/local/bin/socks5-ipv6-watchdog.sh <<WDSCRIPT
 #!/bin/bash
+# Auto-generated watchdog - recovers lost IPv6 and dead proxies
 IFACE="${IPV6_IFACE}"
 CONF="${WORK_DIR}/proxies.conf"
-GW="${gw}"
 RECOVERED=0
-TID=100
 
 [[ -f "\$CONF" ]] || exit 0
 
-# Ensure SLAAC stays active
-sysctl -w net.ipv6.conf.all.accept_ra=2 &>/dev/null || true
-sysctl -w net.ipv6.conf.\${IFACE}.accept_ra=2 &>/dev/null || true
+# --- Check and re-add missing IPv6 addresses ---
+WDSCRIPT
 
+    for ipv6 in "${USED_IPS[@]}"; do
+        cat >> /usr/local/bin/socks5-ipv6-watchdog.sh <<WDCHECK
+if ! ip -6 addr show dev \$IFACE | grep -q "${ipv6}"; then
+    ip -6 addr add ${ipv6}/128 dev \$IFACE 2>/dev/null
+    ip -6 neigh add proxy ${ipv6} dev \$IFACE 2>/dev/null || true
+    RECOVERED=\$((RECOVERED + 1))
+    logger -t socks5-watchdog "Recovered IPv6: ${ipv6}"
+fi
+WDCHECK
+    done
+
+    cat >> /usr/local/bin/socks5-ipv6-watchdog.sh <<'WDTAIL'
+
+# --- Check and restart dead proxy processes ---
 while IFS='|' read -r port user pass ipv6; do
-    TID=\$((TID + 1))
-    if ! ip -6 addr show dev "\$IFACE" | grep -q "\$ipv6"; then
-        ip -6 addr add "\${ipv6}/64" dev "\$IFACE" nodad 2>/dev/null || true
-        ip -6 neigh add proxy "\$ipv6" dev "\$IFACE" 2>/dev/null || true
-        RECOVERED=\$((RECOVERED + 1))
+    if ! ss -tlnp | grep -q ":${port} "; then
+        microsocks -p "$port" -u "$user" -P "$pass" -b "$ipv6" >/dev/null 2>&1 &
+        logger -t socks5-watchdog "Restarted proxy on port ${port} (${ipv6})"
+        RECOVERED=$((RECOVERED + 1))
     fi
-    if ! ip -6 rule show | grep -q "from \$ipv6"; then
-        ip -6 rule add from "\$ipv6" table "\$TID" prio "\$TID" 2>/dev/null || true
-        ip -6 route replace default via "\$GW" dev "\$IFACE" src "\$ipv6" table "\$TID" 2>/dev/null || true
-        RECOVERED=\$((RECOVERED + 1))
-    fi
-    if ! systemctl is-active --quiet "microsocks@\${port}.service" 2>/dev/null; then
-        systemctl restart "microsocks@\${port}.service" 2>/dev/null || true
-        RECOVERED=\$((RECOVERED + 1))
-    fi
-done < "\$CONF"
+done < "$CONF"
 
-(( RECOVERED > 0 )) && logger -t socks5-watchdog "Recovered: \$RECOVERED items"
-WDEOF
+if (( RECOVERED > 0 )); then
+    logger -t socks5-watchdog "Total recovered: $RECOVERED"
+fi
+WDTAIL
 
     chmod +x /usr/local/bin/socks5-ipv6-watchdog.sh
 
     cat > /etc/systemd/system/socks5-ipv6-watchdog.service <<WDSVC
 [Unit]
-Description=SOCKS5 IPv6 Watchdog
+Description=SOCKS5 IPv6 Proxy - Watchdog
 
 [Service]
 Type=oneshot
@@ -578,7 +551,7 @@ WDSVC
 
     cat > /etc/systemd/system/socks5-ipv6-watchdog.timer <<WDTIMER
 [Unit]
-Description=SOCKS5 IPv6 Watchdog Timer
+Description=SOCKS5 IPv6 Proxy - Watchdog Timer
 
 [Timer]
 OnBootSec=120
@@ -591,7 +564,7 @@ WDTIMER
 
     systemctl daemon-reload
     systemctl enable --now socks5-ipv6-watchdog.timer &>/dev/null
-    log_ok "Watchdog active (every 60s)"
+    log_ok "Watchdog active (checks every 60s)"
 }
 
 # ======================== FIREWALL ========================
@@ -600,14 +573,18 @@ configure_firewall() {
     local last_port=$(( START_PORT + PROXY_COUNT - 1 ))
 
     if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "active"; then
+        log_info "Configuring UFW..."
         ufw allow "${first_port}:${last_port}"/tcp &>/dev/null
         log_ok "UFW: opened ports ${first_port}-${last_port}"
+
     elif command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
+        log_info "Configuring firewalld..."
         firewall-cmd --permanent --add-port="${first_port}-${last_port}"/tcp &>/dev/null
         firewall-cmd --reload &>/dev/null
         log_ok "Firewalld: opened ports ${first_port}-${last_port}"
+
     else
-        log_warn "No active firewall. Ensure ports ${first_port}-${last_port} are open."
+        log_warn "No active firewall detected. Ensure ports ${first_port}-${last_port} are accessible."
     fi
 }
 
@@ -615,75 +592,57 @@ configure_firewall() {
 remove_all() {
     log_warn "Removing all IPv6 SOCKS5 proxies..."
 
-    # Detect interface before cleanup
-    local rm_iface
-    rm_iface=$(ip -o link show up | awk -F': ' '!/lo/{print $2}' | head -1)
-
+    # Stop all microsocks processes
     stop_all_proxies
-    log_ok "Proxies stopped"
+    log_ok "Proxy processes stopped"
 
-    # Remove proxy IPv6 addresses (not the system SLAAC address)
-    if [[ -f "$WORK_DIR/proxies.conf" ]]; then
-        while IFS='|' read -r _port _user _pass ipv6; do
-            ip -6 addr del "${ipv6}/64" dev "$rm_iface" 2>/dev/null || true
-            ip -6 neigh del proxy "$ipv6" dev "$rm_iface" 2>/dev/null || true
-        done < "$WORK_DIR/proxies.conf"
-        log_ok "Proxy IPv6 addresses removed"
+    # Remove IPv6 addresses
+    if [[ -f /usr/local/bin/socks5-ipv6-setup.sh ]]; then
+        while IFS= read -r line; do
+            if [[ "$line" == *"addr add"* ]]; then
+                local addr iface
+                addr=$(echo "$line" | grep -oP 'add \K[0-9a-f:]+')
+                iface=$(echo "$line" | grep -oP 'dev \K\S+')
+                ip -6 addr del "${addr}/128" dev "$iface" 2>/dev/null || true
+                ip -6 neigh del proxy "$addr" dev "$iface" 2>/dev/null || true
+            fi
+        done < /usr/local/bin/socks5-ipv6-setup.sh
+        log_ok "IPv6 addresses removed"
     fi
 
-    # Remove source routing (tables 101-600)
-    for tid in $(seq 101 600); do
-        ip -6 rule del table "$tid" 2>/dev/null || true
-        ip -6 route flush table "$tid" 2>/dev/null || true
-    done
-    log_ok "Source routing rules removed"
-
-    # Remove systemd units
-    systemctl disable --now socks5-ipv6-setup.service 2>/dev/null || true
+    # Remove systemd services
+    systemctl disable --now socks5-ipv6.service 2>/dev/null || true
     systemctl disable --now socks5-ipv6-watchdog.timer 2>/dev/null || true
     systemctl disable --now socks5-ipv6-watchdog.service 2>/dev/null || true
-    rm -f /etc/systemd/system/socks5-ipv6-setup.service
-    rm -f /etc/systemd/system/microsocks@.service
+    rm -f /etc/systemd/system/socks5-ipv6.service
     rm -f /etc/systemd/system/socks5-ipv6-watchdog.service
     rm -f /etc/systemd/system/socks5-ipv6-watchdog.timer
     rm -f /usr/local/bin/socks5-ipv6-setup.sh
-    rm -f /usr/local/bin/socks5-ipv6-watchdog.sh
-    # Legacy
-    rm -f /etc/systemd/system/socks5-ipv6.service
     rm -f /usr/local/bin/socks5-ipv6-start.sh
+    rm -f /usr/local/bin/socks5-ipv6-watchdog.sh
     systemctl daemon-reload 2>/dev/null || true
-    log_ok "Systemd units removed"
+    log_ok "Systemd services removed"
 
-    # Remove configs
-    rm -f /etc/gai.conf
+    # Remove network config
     rm -f /etc/netplan/60-socks5-ipv6.yaml
     netplan apply 2>/dev/null || true
     rm -f /etc/sysconfig/network-scripts/ifcfg-*-socks5-ipv6 2>/dev/null || true
     rm -f /etc/network/interfaces.d/socks5-ipv6 2>/dev/null || true
+    log_ok "Network config removed"
 
-    # Remove sysctl but keep accept_ra=2
+    # Remove sysctl
     rm -f /etc/sysctl.d/99-socks5-ndp.conf
     sysctl --system &>/dev/null || true
 
-    # Restore IPv6 SLAAC
-    if [[ -n "$rm_iface" ]]; then
-        sysctl -w "net.ipv6.conf.all.accept_ra=2" &>/dev/null || true
-        sysctl -w "net.ipv6.conf.${rm_iface}.accept_ra=2" &>/dev/null || true
-        sysctl -w "net.ipv6.conf.${rm_iface}.autoconf=1" &>/dev/null || true
-        log_ok "IPv6 SLAAC restored on ${rm_iface}"
-    fi
-
-    # Firewall cleanup
+    # Remove firewall rules (best effort)
     if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "active"; then
-        if [[ -f "$WORK_DIR/proxies.conf" ]] && [[ -s "$WORK_DIR/proxies.conf" ]]; then
-            local fp lp
-            fp=$(head -1 "$WORK_DIR/proxies.conf" | cut -d'|' -f1)
-            lp=$(tail -1 "$WORK_DIR/proxies.conf" | cut -d'|' -f1)
-            ufw delete allow "${fp}:${lp}/tcp" 2>/dev/null || true
-        fi
+        ufw status numbered 2>/dev/null | grep -oP '\d+:\d+' | while read -r range; do
+            ufw delete allow "${range}/tcp" 2>/dev/null || true
+        done || true
     fi
 
-    rm -rf "$WORK_DIR" "$OUTPUT_FILE" /run/socks5-ipv6
+    # Remove work dir and output
+    rm -rf "$WORK_DIR" "$PID_DIR" "$OUTPUT_FILE"
 
     log_ok "Cleanup complete. All proxies removed."
     exit 0
@@ -701,11 +660,11 @@ verify_proxies() {
     result=$(curl -s -m 30 -x "socks5://${user}:${pass}@127.0.0.1:${port}" https://api64.ipify.org 2>/dev/null || true)
 
     if [[ "$result" == "$ipv6" ]]; then
-        log_ok "PERFECT: outgoing IPv6 = ${result}"
+        log_ok "Proxy verified: outgoing IPv6 = ${result}"
     elif [[ -n "$result" ]]; then
-        log_warn "Proxy works, outgoing IP: ${result} (expected ${ipv6})"
+        log_warn "Proxy works but outgoing IP: ${result} (expected ${ipv6})"
     else
-        log_warn "Proxy verification timed out"
+        log_warn "Proxy verification timed out (may still work for IPv4 targets)"
     fi
 }
 
@@ -713,6 +672,8 @@ verify_proxies() {
 show_summary() {
     local actual=${ACTUAL_STARTED:-$PROXY_COUNT}
     local fails=${ACTUAL_FAILED:-0}
+    local listening
+    listening=$(ss -tlnp 2>/dev/null | grep -c "microsocks" || echo 0)
 
     echo ""
     if (( fails == 0 )); then
@@ -721,19 +682,19 @@ show_summary() {
         echo -e "${GREEN}=================================================================${NC}"
     else
         echo -e "${YELLOW}=================================================================${NC}"
-        echo -e "${YELLOW}  ${actual}/${PROXY_COUNT} RUNNING (${fails} FAILED — auto-restart)${NC}"
+        echo -e "${YELLOW}  ${actual}/${PROXY_COUNT} PROXIES STARTED (${fails} FAILED)${NC}"
+        echo -e "${YELLOW}  Listening now: ${listening} | Watchdog will retry failed ones${NC}"
         echo -e "${YELLOW}=================================================================${NC}"
     fi
     echo ""
 
     echo -e "${CYAN}--- socks5://user:pass@ip:port ---${NC}"
     head -3 "${WORK_DIR}/url.txt"
-    local remaining=$(( PROXY_COUNT - 3 ))
-    (( remaining > 0 )) && echo "  ... (${remaining} more) ..."
+    echo "  ... ($(( PROXY_COUNT - 3 )) more) ..."
     echo ""
-    echo -e "${CYAN}--- socks5://IP:Port:User:Pass ---${NC}"
+    echo -e "${CYAN}--- IP:Port:User:Pass ---${NC}"
     head -3 "${WORK_DIR}/ipport.txt"
-    (( remaining > 0 )) && echo "  ... (${remaining} more) ..."
+    echo "  ... ($(( PROXY_COUNT - 3 )) more) ..."
 
     echo ""
     echo -e "${CYAN}Proxy files:${NC}"
@@ -741,16 +702,17 @@ show_summary() {
     echo -e "  URL format  : ${WORK_DIR}/url.txt"
     echo -e "  IP:Port     : ${WORK_DIR}/ipport.txt"
     echo ""
-    local first_line tp tu tps tv6
-    first_line=$(head -1 "$WORK_DIR/proxies.conf")
-    IFS='|' read -r tp tu tps tv6 <<< "$first_line"
     echo -e "${YELLOW}Quick test:${NC}"
+    local first_line
+    first_line=$(head -1 "$WORK_DIR/proxies.conf")
+    local tp tu tps tv6
+    IFS='|' read -r tp tu tps tv6 <<< "$first_line"
     echo -e "  curl -x socks5://${tu}:${tps}@${PUBLIC_IPV4}:${tp} https://api64.ipify.org"
     echo ""
     echo -e "${YELLOW}Management:${NC}"
-    echo -e "  Remove all : $0 -r"
-    echo -e "  Status     : systemctl list-units 'microsocks@*' --no-pager"
-    echo -e "  Logs       : journalctl -u microsocks@${tp} --no-pager -n 20"
+    echo -e "  Remove all  : $0 -r"
+    echo -e "  Status      : ss -tlnp | grep microsocks | wc -l"
+    echo -e "  Watchdog log: journalctl -t socks5-watchdog"
     echo ""
 }
 
@@ -759,7 +721,8 @@ main() {
     check_root
     detect_os
 
-    local REMOVE=0 CUSTOM_COUNT=0
+    local REMOVE=0
+    local CUSTOM_COUNT=0
 
     while getopts "rn:p:h" opt; do
         case $opt in
@@ -767,56 +730,61 @@ main() {
             n) CUSTOM_COUNT=$OPTARG ;;
             p) START_PORT=$OPTARG ;;
             h)
-                echo "Usage: $0 [-n COUNT] [-p PORT] [-r] [-h]"
+                echo "Usage: $0 [OPTIONS]"
+                echo ""
+                echo "Options:"
+                echo "  -n COUNT   Number of proxies (default: auto based on RAM)"
+                echo "  -p PORT    Start port (default: ${START_PORT})"
+                echo "  -r         Remove all proxies and cleanup"
+                echo "  -h         Show this help"
                 exit 0
                 ;;
-            *) echo "Usage: $0 [-n COUNT] [-p PORT] [-r] [-h]"; exit 1 ;;
+            *) echo "Usage: $0 [-r] [-n count] [-p port] [-h]"; exit 1 ;;
         esac
     done
 
     echo -e "${CYAN}"
     echo "  ============================================"
     echo "    IPv6 SOCKS5 Proxy Auto-Setup v${SCRIPT_VERSION}"
-    echo "    Engine: microsocks + systemd"
+    echo "    Engine: microsocks"
     echo "  ============================================"
     echo -e "${NC}"
 
     [[ $REMOVE -eq 1 ]] && remove_all
 
-    # Step 1: Ensure IPv6 is available
-    ensure_ipv6
-
-    # Step 2: Detect IPv6 config
+    # Step 1: Detect & validate IPv6
     detect_ipv6
     check_ipv6_connectivity
 
-    # Step 3: Calculate proxy count
+    # Step 2: Calculate proxy count
     calculate_proxy_count
     if (( CUSTOM_COUNT > 0 )); then
         PROXY_COUNT=$CUSTOM_COUNT
-        log_info "Custom count: ${PROXY_COUNT} proxies"
+        log_info "Using custom count: ${PROXY_COUNT} proxies"
     fi
 
-    # Step 4: Install deps
+    # Step 3: Install dependencies
     install_deps
 
-    # Step 5: Create proxies
+    # Step 4: Test IPv6
+    test_ipv6_assignment
+
+    # Step 5: Create & assign proxies
     echo ""
-    log_info "Generating ${PROXY_COUNT} proxies..."
+    log_info "Generating ${PROXY_COUNT} proxies with unique IPv6 addresses..."
     echo ""
     USED_IPS=()
     setup_proxies
 
-    # Step 6: System config
+    # Step 6: NDP + persistence + firewall
     echo ""
-    setup_ipv6_preference
-    setup_ipv6_routing
     setup_ndp
     make_persistent
     configure_firewall
 
-    # Step 7: Start
+    # Step 7: Raise system limits + start all proxies
     echo ""
+    bump_ulimits
     start_all_proxies
 
     # Step 8: Verify
