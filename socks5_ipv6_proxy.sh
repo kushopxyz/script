@@ -112,22 +112,22 @@ ensure_ipv6() {
     # No global IPv6 — try router discovery
     log_info "No global IPv6 found. Trying router discovery on ${iface}..."
 
-    local ra_output gw=""
+    local ra_output="" gw="" prefix=""
+
+    # Try rdisc6 with multiple attempts
     if command -v rdisc6 &>/dev/null; then
-        ra_output=$(rdisc6 -1 "$iface" 2>/dev/null || true)
+        ra_output=$(rdisc6 -w 8000 "$iface" 2>/dev/null || true)
         gw=$(echo "$ra_output" | grep -oP 'from \K[0-9a-f:]+' | head -1 || true)
+        prefix=$(echo "$ra_output" | grep -oP 'Prefix\s+:\s+\K[0-9a-f:]+::/[0-9]+' | head -1 || true)
     fi
 
-    # Wait up to 15s for SLAAC to assign address
+    # Wait up to 10s for SLAAC to assign address
     local waited=0
-    while (( waited < 15 )); do
+    while (( waited < 10 )); do
         if ip -6 addr show dev "$iface" scope global 2>/dev/null | grep -q "inet6"; then
             log_ok "IPv6 obtained via SLAAC on ${iface}"
-            # Add default route if missing
             if ! ip -6 route show default 2>/dev/null | grep -q "default"; then
-                if [[ -n "${gw:-}" ]]; then
-                    ip -6 route add default via "$gw" dev "$iface" 2>/dev/null || true
-                fi
+                [[ -n "$gw" ]] && ip -6 route add default via "$gw" dev "$iface" 2>/dev/null || true
             fi
             return 0
         fi
@@ -135,12 +135,42 @@ ensure_ipv6() {
         waited=$((waited + 1))
     done
 
-    # SLAAC failed — try adding default route manually and trigger again
-    if [[ -n "${gw:-}" ]]; then
+    # SLAAC auto-assign failed — manually construct address from prefix + MAC
+    if [[ -n "$prefix" && -n "$gw" ]]; then
+        log_info "SLAAC auto-assign failed. Building address from prefix ${prefix}..."
+
+        # Get MAC address and compute EUI-64
+        local mac ll_addr
+        mac=$(ip link show dev "$iface" | awk '/ether/{print $2}')
+        if [[ -n "$mac" ]]; then
+            ll_addr=$(python3 -c "
+import ipaddress
+mac = '${mac}'.split(':')
+mac[0] = format(int(mac[0], 16) ^ 0x02, '02x')
+eui = mac[0]+mac[1] + ':' + mac[2] + 'ff:fe' + mac[3] + ':' + mac[4]+mac[5]
+prefix = '${prefix%%/*}'
+addr = prefix.rstrip(':') + ':' + eui
+print(str(ipaddress.IPv6Address(addr)))
+" 2>/dev/null || true)
+
+            if [[ -n "$ll_addr" ]]; then
+                ip -6 addr add "${ll_addr}/64" dev "$iface" 2>/dev/null || true
+                ip -6 route add default via "$gw" dev "$iface" 2>/dev/null || true
+                sleep 2
+                if ip -6 addr show dev "$iface" scope global 2>/dev/null | grep -q "inet6"; then
+                    log_ok "IPv6 manually assigned: ${ll_addr}"
+                    return 0
+                fi
+            fi
+        fi
+    fi
+
+    # Last resort: try adding gateway and wait
+    if [[ -n "$gw" ]]; then
         ip -6 route add default via "$gw" dev "$iface" 2>/dev/null || true
-        sleep 3
+        sleep 5
         if ip -6 addr show dev "$iface" scope global 2>/dev/null | grep -q "inet6"; then
-            log_ok "IPv6 obtained after adding gateway ${gw}"
+            log_ok "IPv6 obtained after adding gateway"
             return 0
         fi
     fi
