@@ -112,10 +112,10 @@ ensure_ipv6() {
     # No global IPv6 — try router discovery
     log_info "No global IPv6 found. Trying router discovery on ${iface}..."
 
-    local ra_output gw
+    local ra_output gw=""
     if command -v rdisc6 &>/dev/null; then
         ra_output=$(rdisc6 -1 "$iface" 2>/dev/null || true)
-        gw=$(echo "$ra_output" | grep -oP 'from \K[0-9a-f:]+' | head -1)
+        gw=$(echo "$ra_output" | grep -oP 'from \K[0-9a-f:]+' | head -1 || true)
     fi
 
     # Wait up to 15s for SLAAC to assign address
