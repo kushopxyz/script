@@ -112,9 +112,13 @@ ensure_ipv6() {
     # No global IPv6 — try router discovery
     log_info "No global IPv6 found. Trying router discovery on ${iface}..."
 
+    # Install ndisc6 if not available (install_deps runs later)
+    if ! command -v rdisc6 &>/dev/null; then
+        apt-get install -y -qq ndisc6 >/dev/null 2>&1 || dnf install -y -q ndisc6 >/dev/null 2>&1 || true
+    fi
+
     local ra_output="" gw="" prefix=""
 
-    # Try rdisc6 with multiple attempts
     if command -v rdisc6 &>/dev/null; then
         ra_output=$(rdisc6 -w 8000 "$iface" 2>/dev/null || true)
         gw=$(echo "$ra_output" | grep -oP 'from \K[0-9a-f:]+' | head -1 || true)
