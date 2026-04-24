@@ -530,13 +530,58 @@ need_cmd firebase
 need_cmd curl
 need_cmd jq
 
-PID="$(gcloud config get-value project 2>/dev/null || true)"
 ACCOUNT="$(gcloud config get-value account 2>/dev/null || true)"
 REGION="$(gcloud config get-value compute/region 2>/dev/null || true)"
 
-[[ -z "${PID}" || "${PID}" == "(unset)" ]] && { err "Chua co project. Chay: gcloud config set project YOUR_PROJECT_ID"; exit 1; }
 [[ -z "${ACCOUNT}" || "${ACCOUNT}" == "(unset)" ]] && { err "Chua dang nhap. Chay: gcloud auth login"; exit 1; }
 [[ -z "${REGION}" || "${REGION}" == "(unset)" ]] && REGION="${DEFAULT_REGION}"
+
+ensure_project() {
+  local projects_json project_count selected_pid new_pid create_resp operation_name op_resp done_state
+
+  info "Kiem tra danh sach Google Cloud project..."
+  projects_json="$(gcloud projects list --format=json 2>/dev/null || echo '[]')"
+  project_count="$(printf '%s' "${projects_json}" | jq 'length')"
+
+  if [[ "${project_count}" -gt 0 ]]; then
+    selected_pid="$(printf '%s' "${projects_json}" | jq -r '.[].projectId' | shuf -n 1)"
+    [[ -z "${selected_pid}" || "${selected_pid}" == "null" ]] && { err "Khong lay duoc projectId tu danh sach project"; exit 1; }
+    PID="${selected_pid}"
+    info "Da tim thay ${project_count} project. Chon ngau nhien: ${PID}"
+    gcloud config set project "${PID}" >/dev/null
+    ok "Da set project: ${PID}"
+    return 0
+  fi
+
+  warn "Khong co project nao. Tao project moi..."
+  new_pid="firebase-spark-$(date +%Y%m%d%H%M%S)-$((RANDOM % 9000 + 1000))"
+
+  create_resp="$(gcloud projects create "${new_pid}" --name="Firebase Spark Demo" --format=json 2>/dev/null || true)"
+  operation_name="$(printf '%s' "${create_resp}" | jq -r '.name // empty' 2>/dev/null || true)"
+
+  if [[ -n "${operation_name}" ]]; then
+    info "Dang doi tao project xong..."
+    for _ in $(seq 1 30); do
+      op_resp="$(gcloud operations describe "${operation_name}" --format=json 2>/dev/null || true)"
+      done_state="$(printf '%s' "${op_resp}" | jq -r '.done // false' 2>/dev/null || echo false)"
+      [[ "${done_state}" == "true" ]] && break
+      sleep 5
+    done
+  else
+    info "Doi project moi san sang..."
+    sleep 20
+  fi
+
+  retry 12 10 gcloud projects describe "${new_pid}" >/dev/null
+
+  PID="${new_pid}"
+  gcloud config set project "${PID}" >/dev/null
+  ok "Da tao va set project moi: ${PID}"
+
+  warn "Neu buoc enable API bi loi billing/quota, hay lien ket Billing Account cho project ${PID} roi chay lai script."
+}
+
+ensure_project
 
 ACCESS_TOKEN="$(gcloud auth print-access-token)"
 FB="projects/${PID}"
